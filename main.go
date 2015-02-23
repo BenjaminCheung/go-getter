@@ -1,87 +1,109 @@
 package main
 
 import (
-	"crypto/sha1"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"time"
+
+	"github.com/crowdmob/goamz/aws"
+	"github.com/crowdmob/goamz/s3"
 )
 
 type (
 	Config struct {
-		Urls []string `json:"urls"`
+		RequestList []Request `json:"requestList"`
+	}
+	Request struct {
+		URL      string `json:"url"`
+		Interval int64  `json:"requestInterval"`
+		FileName string `json:"fileName"`
 	}
 )
 
 var (
 	outdir = flag.String("outdir", ".", "directory to output files to")
 	help   = flag.Bool("help", false, "show usage")
+
+	workers = make(chan struct{}, 10)
+
+	auth = aws.Auth{
+		AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+	}
+
+	connection = s3.New(auth, aws.USWest2)
+	mybucket   = connection.Bucket("apiassets")
 )
 
 func main() {
 
 	flag.Parse()
-
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	if *help {
 		fmt.Println("usage: go-getter [-flags]")
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
 
-	file, err := os.Open("config.json")
+	data, err := mybucket.Get("config.json")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer file.Close()
 
+	// open config.json
 	var config Config
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
+	if err := json.Unmarshal(data, &config); err != nil {
 		log.Fatal(err)
 	}
 
-	if *outdir != "." {
-		os.MkdirAll(*outdir, 0777)
+	// fmt.Printf("%s", data)
+
+	for _, req := range config.RequestList {
+		workers <- struct{}{}
+		go refreshJson(req)
 	}
-
-	// fmt.Printf("%#v", config)
-
-	for _, url := range config.Urls {
-
-		// get the file
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			log.Fatalf("Expected 200, got %d %s", resp.StatusCode, resp.Status)
-		}
-
-		// create outfile
-		h := sha1.New()
-		h.Write([]byte(url))
-		filename := fmt.Sprintf("%x", h.Sum(nil))
-
-		out, err := os.OpenFile(filepath.Join(*outdir, filename), os.O_CREATE|os.O_WRONLY, 0666)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// copy the contents
-		if _, err := io.Copy(out, resp.Body); err != nil {
-			log.Fatal(err)
-		}
-
-		out.Close()
-		resp.Body.Close()
-
-		// get url
-		fmt.Println(filename)
+	// to ensure workers are finished
+	for i := 0; i < cap(workers); i++ {
+		workers <- struct{}{}
 	}
 
 	log.Println("done!")
+}
+
+func refreshJson(req Request) error {
+	defer func() { <-workers }()
+	//if interval has passed go get json from url
+	resp, err := mybucket.Head("apiresponse/"+req.FileName, nil)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		t, err := time.Parse(time.RFC1123, resp.Header.Get("Last-Modified"))
+		if err == nil && time.Now().Add(-time.Duration(req.Interval)*time.Second).After(t) {
+			return nil
+		}
+	}
+
+	// get the file
+	resp, err = http.Get(req.URL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Expected 200, got %d %s", resp.StatusCode, resp.Status)
+	}
+	data, err := ioutil.ReadAll(resp.Body)
+
+	if err != nil {
+		return err
+	}
+
+	err = mybucket.Put("apiresponse/"+req.FileName, data, "application/json", s3.BucketOwnerFull, s3.Options{})
+	if err != nil {
+		return err
+	}
+	return nil
 }
